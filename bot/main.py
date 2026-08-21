@@ -65,7 +65,8 @@ def run_once(s, journal, spot_feed):
 def main():
     s = get_settings()
     journal = Journal(s.db_path)
-    spot_feed = spot.SpotFeed(f"{s.coin.upper()}/USDT")
+    symbol = gamma.SYMBOL_BY_COIN.get(s.coin.strip().lower(), s.coin.upper())
+    spot_feed = spot.SpotFeed(f"{symbol}/USDT")
     print(f"Bot iniciado: coin={s.coin} dry_run={s.dry_run} "
           f"bankroll=${s.bankroll_usd}")
     try:

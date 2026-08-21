@@ -1,39 +1,54 @@
-#!/usr/bin/env bash
-# Teste rápido do F1 (data feed + sinal) sem entrar no loop infinito.
-# Roda UMA passada e imprime o que o bot faria (dry-run, nenhuma ordem enviada).
-set -e
-cd "$(dirname "$0")"
-export PYTHONPATH="$PWD"
-python3 - <<'PY'
+"""Teste rápido do F1 (data feed + sinal) — UMA passada, sem loop.
+
+Rode com:
+    python -m bot.run_once
+ou
+    python bot/run_once.py
+
+É dry-run: não envia ordem nenhuma. Apenas busca mercados, lê o book,
+gera sinal e imprime o que faria.
+"""
+from __future__ import annotations
+
 from bot.config import get_settings
-from bot.data import gamma, clob, spot
-from bot.signal.mean_reversion import evaluate
-from bot.risk.sizing import plan_trade
+from bot.data import clob, gamma, spot
 
-s = get_settings()
-print(f"coin={s.coin}  dry_run={s.dry_run}")
 
-markets = gamma.fetch_markets(s, coin=s.coin, kind="updown", limit=50)
-print(f"mercados Up/Down ativos: {len(markets)}")
-if not markets:
-    raise SystemExit("Nenhum mercado encontrado — verifique rede/API.")
+def main() -> None:
+    s = get_settings()
+    symbol = gamma.SYMBOL_BY_COIN.get(s.coin.strip().lower(), s.coin.upper())
+    print(f"coin={s.coin}  symbol={symbol}  dry_run={s.dry_run}")
 
-for m in markets[:5]:
-    tok = gamma.token_id_for_outcome(m, "Up")
-    if not tok:
-        print(f"  (sem token 'Up') {m.question}")
-        continue
-    book = clob.get_book(s, tok)
-    print(f"\n  {m.question}")
-    print(f"    outcomes={m.outcomes}  prices={m.outcome_prices}")
-    print(f"    bid={book.best_bid} ask={book.best_ask} mid={book.mid:.4f} "
-          f"spread={book.spread:.4f}")
-    print(f"    fees_enabled={m.fees_enabled} taker_fee={m.taker_fee_rate} "
-          f"min_size={m.min_size} min_tick={m.min_tick}")
+    markets = gamma.fetch_markets(s, coin=s.coin, kind="updown", limit=20)
+    print(f"mercados 'Up or Down' ativos ({s.coin}): {len(markets)}")
+    if not markets:
+        print("  -> nenhum encontrado. Verifique rede/API ou tente outra moeda.")
+        return
 
-# sinal de exemplo com spot
-sf = spot.SpotFeed(f"{s.coin.upper()}/USDT")
-chg = sf.pct_change(s.mr_lookback_minutes)
-print(f"\nspot {s.coin}/USDT variação {s.mr_lookback_minutes}m: "
-      f"{chg:+.4%}" if chg is not None else "n/a")
-PY
+    for m in markets[:6]:
+        tok = gamma.token_id_for_outcome(m, "Up")
+        print(f"\n  [{m.timeframe}] {m.question}")
+        print(f"    outcomes={m.outcomes}  prices={m.outcome_prices}")
+        if tok:
+            try:
+                book = clob.get_book(s, tok)
+                print(f"    bid={book.best_bid}  ask={book.best_ask}  "
+                      f"mid={book.mid:.4f}  spread={book.spread:.4f}")
+            except Exception as e:  # noqa: BLE001
+                print(f"    (book indisponível: {e!r})")
+        else:
+            print("    (sem token 'Up')")
+        print(f"    fees_enabled={m.fees_enabled}  taker_fee={m.taker_fee_rate:.0%}  "
+              f"min_size={m.min_size}  min_tick={m.min_tick}")
+
+    # sinal de exemplo com spot
+    sf = spot.SpotFeed(f"{symbol}/USDT")
+    chg = sf.pct_change(s.mr_lookback_minutes)
+    if chg is not None:
+        print(f"\nspot {symbol}/USDT variação {s.mr_lookback_minutes}m: {chg:+.4%}")
+    else:
+        print(f"\nspot {symbol}/USDT: indisponível (sinal vira 'skip', sem impacto no F1)")
+
+
+if __name__ == "__main__":
+    main()
