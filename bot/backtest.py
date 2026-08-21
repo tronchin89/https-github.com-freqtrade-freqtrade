@@ -58,13 +58,15 @@ def fetch_closed_markets(s: Settings, coin: str, timeframes, limit: int,
     slugs = SERIES_BY_COIN.get(coin, {})
     out = []
     seen = set()
-    page_size = min(limit, 500)
+    # A API da Gamma cap ~100 eventos por página (independente do `limit` pedido).
+    page_size = 100
     for tf in timeframes:
         slug = slugs.get(tf)
         if not slug:
             continue
         offset = 0
-        while len([m for m, _ in out]) < limit * len(timeframes) and offset < limit:
+        collected = 0
+        while collected < limit:
             params = {
                 "series_slug": slug,
                 "closed": "true",
@@ -89,9 +91,12 @@ def fetch_closed_markets(s: Settings, coin: str, timeframes, limit: int,
                         continue
                     seen.add(m.id)
                     out.append((m, mjson))
+                    collected += 1
+            # página cheia => continua; senão terminou a série
             if len(events) < page_size:
                 break
             offset += page_size
+            time.sleep(0.1)  # gentileza com a API entre páginas
     return out
 
 
