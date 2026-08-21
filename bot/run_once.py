@@ -33,7 +33,8 @@ def main() -> None:
             try:
                 book = clob.get_book(s, tok)
                 print(f"    bid={book.best_bid}  ask={book.best_ask}  "
-                      f"mid={book.mid:.4f}  spread={book.spread:.4f}")
+                      f"mid={book.mid:.4f}  spread={book.spread:.4f}  "
+                      f"last={book.last_trade_price}")
             except Exception as e:  # noqa: BLE001
                 print(f"    (book indisponível: {e!r})")
         else:

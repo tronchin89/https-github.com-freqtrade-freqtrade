@@ -18,6 +18,7 @@ class Book:
     best_ask: float
     mid: float
     spread: float
+    last_trade_price: float = 0.0
 
 
 def get_book(s: Settings, token_id: str) -> Book:
@@ -26,10 +27,14 @@ def get_book(s: Settings, token_id: str) -> Book:
     data = resp.json()
     bids = data.get("bids") or []
     asks = data.get("asks") or []
-    best_bid = float(bids[0]["price"]) if bids else 0.0
-    best_ask = float(asks[0]["price"]) if asks else 0.0
+    # IMPORTANTE: a API retorna os níveis em ordem "profunda primeiro", ou seja,
+    # bids[0] é o MENOR bid e asks[0] é o MAIOR ask. O melhor bid é o MÁXIMO
+    # preço de compra; o melhor ask é o MÍNIMO preço de venda.
+    best_bid = max((float(b["price"]) for b in bids), default=0.0)
+    best_ask = min((float(a["price"]) for a in asks), default=0.0)
     mid = (best_bid + best_ask) / 2 if best_bid and best_ask else 0.0
-    return Book(token_id, best_bid, best_ask, mid, best_ask - best_bid)
+    last_trade = float(data.get("last_trade_price", 0) or 0)
+    return Book(token_id, best_bid, best_ask, mid, best_ask - best_bid, last_trade)
 
 
 def get_price(s: Settings, token_id: str, side: str = "buy") -> float:
