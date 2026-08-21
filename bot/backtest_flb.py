@@ -6,14 +6,17 @@ Hipótese (a mais documentada na literatura de prediction markets):
   => Comprar o favorito e/ou comprar "No" no longshot deveria ter EV positivo.
 
 Como testamos (sem dataset em disco, usando a Gamma API):
-  1. Coleta mercados RESOLVIDOS da categoria (politics / sports) via tag_slug.
+  1. Coleta mercados RESOLVIDOS da categoria (politics / sports) via
+     `order=closedTime&ascending=false` + offset (mais recentes primeiro).
+     NOTA: filtrar por `end_date` NÃO serve — `endDate` é o prazo AGENDADO,
+     não a data de resolução; e `end_date_min == end_date_max` dá 422.
   2. Determina quem venceu (Yes/No) pelo outcomePrices resolvido.
-  3. Baixa o histórico de preço do token "Yes" (prices-history, minuto a minuto).
+  3. Baixa o histórico de preço do token "Yes" (prices-history).
   4. Toma o preço de referência `lookback` minutos ANTES da resolução
-     (ponto realmente negociável, sem lookahead bias).
+     (ancorado no `closedTime` real, sem lookahead bias).
   5. Calibração: agrupa por decil de preço e compara win rate real vs preço.
-  6. Estratégia: "comprar favorito (>= T_high)" e "comprar No em longshot
-     (<= T_low)", segurando até resolver, com EV líquido de taxa dinâmica.
+  6. Estratégia: comprar favorito / fadar longshot, segurando até resolver,
+     com taxa taker dinâmica correta: fee = feeRate * p * (1-p)  (exponent=1).
 
 USO:
     python -m bot.backtest_flb                       # sports, 1h antes da resolução
@@ -28,16 +31,23 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import requests
-
-import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from bot.config import Settings, get_settings
 
-# Sessão com retry/backoff (Polymarket está atrás de Cloudflare e às vezes
-# reseta conexões; retry aguenta resets transitórios na máquina do usuário).
+# taxa de taker por categoria (fallback; pico a $0.50). O ideal é ler
+# feeSchedule.rate de cada mercado (V3 usa exponent=1 na maioria).
+TAG_FEE_RATE = {
+    "politics": 0.05,
+    "sports": 0.05,
+    "economics": 0.05,
+    "crypto": 0.07,
+}
+
+
 def _session() -> requests.Session:
+    """Sessão com retry/backoff (Polymarket está atrás de Cloudflare)."""
     s = requests.Session()
     retry = Retry(
         total=4,
@@ -53,14 +63,6 @@ def _session() -> requests.Session:
     })
     return s
 
-# taxa de taker por categoria (pico, a $0.50). Fonte: fee schedule Polymarket.
-TAG_FEE_RATE = {
-    "politics": 0.04,
-    "sports": 0.05,
-    "economics": 0.05,
-    "crypto": 0.07,
-}
-
 
 def _loads(value, default):
     if isinstance(value, (list, tuple)):
@@ -71,69 +73,129 @@ def _loads(value, default):
         return default
 
 
-def _day_range(start: str, end: str):
-    from datetime import timedelta as _td
-    d0 = datetime.strptime(start, "%Y-%m-%d")
-    d1 = datetime.strptime(end, "%Y-%m-%d")
-    cur = d0
-    while cur <= d1:
-        day = cur.strftime("%Y-%m-%d")
-        yield day, day
-        cur += _td(days=1)
+def _parse_ts(value):
+    """Timestamp unix (segundos) a partir de `closedTime` / `umaEndDate`."""
+    if not value:
+        return None
+    value = str(value).strip()
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        pass
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S%z").timestamp()
+    except ValueError:
+        return None
 
 
-def fetch_tag_markets(s: Settings, tag: str, end_min: str, end_max: str, limit: int):
-    """Mercados resolvidos binários da tag, paginando por dia (evita offset alto)."""
+def _outcomes(mjson):
+    return [str(o).lower() for o in _loads(mjson.get("outcomes"), [])]
+
+
+def _tokens(mjson):
+    return [str(t) for t in _loads(mjson.get("clobTokenIds"), [])]
+
+
+def is_yesno(mjson) -> bool:
+    outs = _outcomes(mjson)
+    return len(outs) == 2 and len(_tokens(mjson)) == 2 and "yes" in outs and "no" in outs
+
+
+def yes_won(mjson) -> bool | None:
+    """True se 'Yes' venceu, False se 'No', None se não-Yes/No ou indefinido."""
+    if not is_yesno(mjson):
+        return None
+    prices = _loads(mjson.get("outcomePrices"), [])
+    if len(prices) != 2:
+        return None
+    try:
+        p0, p1 = float(prices[0]), float(prices[1])
+    except (TypeError, ValueError):
+        return None
+    if p0 == 1 and p1 == 0:
+        return _outcomes(mjson)[0] == "yes"
+    if p0 == 0 and p1 == 1:
+        return _outcomes(mjson)[1] == "yes"
+    return None
+
+
+def yes_token_id(mjson) -> str | None:
+    outs = _outcomes(mjson)
+    toks = _tokens(mjson)
+    for tok, out in zip(toks, outs):
+        if out == "yes":
+            return tok
+    return None
+
+
+def market_fee(mjson, tag: str) -> tuple[float, float]:
+    """(feeRate, exponent) do mercado; 0 se fee não habilitado."""
+    if not mjson.get("feesEnabled"):
+        return 0.0, 1.0
+    fs = mjson.get("feeSchedule") or {}
+    rate = float(fs.get("rate", TAG_FEE_RATE.get(tag, 0.05)))
+    exponent = float(fs.get("exponent", 1.0))
+    return rate, exponent
+
+
+def fetch_tag_markets(s: Settings, tag: str, cutoff_ts: float, limit: int):
+    """Mercados resolvidos Yes/No da tag, mais recentes primeiro, até `cutoff_ts`.
+
+    Usa `order=closedTime&ascending=false` + offset (NÃO filtra por end_date:
+    endDate é o prazo agendado, e ranges vazios dão 422). Para de paginar ao
+    passar de `cutoff_ts` ou ao atingir `limit`.
+    """
+    session = _session()
     out = []
     seen = set()
-    session = _session()
-    for day_min, day_max in _day_range(end_min, end_max):
-        if len(out) >= limit:
-            break
+    page = 100
+    offset = 0
+    max_offset = 10000  # trava de segurança; para gracefulmente se passar
+
+    while offset <= max_offset and len(out) < limit:
         params = {
             "tag_slug": tag,
             "closed": "true",
-            "end_date_min": day_min,
-            "end_date_max": day_max,
-            "limit": 100,
-            "offset": 0,
+            "order": "closedTime",
+            "ascending": "false",
+            "limit": page,
+            "offset": offset,
         }
         try:
             resp = session.get(f"{s.gamma_host}/events", params=params, timeout=20)
             resp.raise_for_status()
         except requests.RequestException as e:
-            print(f"  [aviso] {tag} {day_min}: {e!r}")
-            continue
-        for ev in resp.json():
+            print(f"  [aviso] offset={offset}: {e!r}")
+            break
+        events = resp.json()
+        if not events:
+            break
+
+        oldest_ts = None
+        for ev in events:
             for mjson in ev.get("markets", []):
-                outcomes = _loads(mjson.get("outcomes"), [])
-                tokens = _loads(mjson.get("clobTokenIds"), [])
-                # só mercados binários simples (2 outcomes, 2 tokens)
-                if len(outcomes) != 2 or len(tokens) != 2:
+                if not is_yesno(mjson):
                     continue
                 mid = mjson.get("id")
                 if mid in seen:
                     continue
+                res_ts = _parse_ts(mjson.get("umaEndDate") or mjson.get("closedTime"))
+                if res_ts is None:
+                    continue
+                if oldest_ts is None or res_ts < oldest_ts:
+                    oldest_ts = res_ts
                 seen.add(mid)
-                out.append(mjson)
+                out.append((mjson, res_ts))
+        # se a página mais antiga já é anterior ao cutoff, paramos
+        if oldest_ts is not None and oldest_ts < cutoff_ts:
+            break
+        offset += page
         time.sleep(0.05)
-    return out
 
-
-def yes_won(mjson: dict) -> bool | None:
-    """True se 'Yes' venceu, False se 'No', None se indeterminado."""
-    prices = _loads(mjson.get("outcomePrices"), [])
-    outcomes = _loads(mjson.get("outcomes"), ["Yes", "No"])
-    if len(prices) == 2:
-        try:
-            p0, p1 = float(prices[0]), float(prices[1])
-        except (TypeError, ValueError):
-            p0 = p1 = -1
-        if p0 == 1 and p1 == 0:
-            return outcomes[0].lower() == "yes"
-        if p0 == 0 and p1 == 1:
-            return outcomes[1].lower() == "yes"
-    return None
+    # filtra de fato pelo cutoff (só mercados resolvidos dentro da janela)
+    filtered = [(m, t) for (m, t) in out if t >= cutoff_ts]
+    filtered.sort(key=lambda x: -x[1])  # mais recente primeiro
+    return filtered
 
 
 def fetch_price_history(s: Settings, token_id: str) -> list[tuple[int, float]]:
@@ -154,12 +216,11 @@ def fetch_price_history(s: Settings, token_id: str) -> list[tuple[int, float]]:
     return out
 
 
-def reference_price(hist: list[tuple[int, float]], lookback_min: int) -> float | None:
-    """Preço `lookback_min` minutos antes do último ponto (ponto negociável)."""
+def reference_price(hist: list[tuple[int, float]], res_ts: float, lookback_min: int) -> float | None:
+    """Preço `lookback_min` minutos antes da resolução (ponto negociável)."""
     if not hist:
         return None
-    target_t = hist[-1][0] - lookback_min * 60
-    # pega o ponto mais próximo ANTES ou igual a target_t (sem lookahead)
+    target_t = res_ts - lookback_min * 60
     best = None
     for t, p in hist:
         if t <= target_t:
@@ -167,33 +228,43 @@ def reference_price(hist: list[tuple[int, float]], lookback_min: int) -> float |
         else:
             break
     if best is None:
-        # histórico muito curto: usa o primeiro preço disponível
-        best = hist[0][1]
+        best = hist[0][1]  # histórico curto: usa o primeiro preço disponível
     return best
 
 
-def taker_fee_frac(price: float, rate: float) -> float:
+def fee_fraction(price: float, rate: float, exponent: float = 1.0) -> float:
+    """Taxa taker como fração do notional (fórmula V3).
+
+    fee = C * p * feeRate * (p*(1-p))^exponent  =>  fee/notional = rate*(p*(1-p))^exponent.
+    """
     p = max(0.0, min(1.0, price))
-    return rate * (1 - p)
+    return rate * (p * (1 - p)) ** exponent
 
 
-def run(samples, tag, lookback_min, rate):
+def simulate_hold(entry: float, won: bool, rate: float, exponent: float) -> float:
+    """PnL (por $1 de face) de comprar a `entry` e segurar até resolver."""
+    fee = fee_fraction(entry, rate, exponent)
+    cost = entry * (1 + fee)
+    return (1 - cost) if won else (-cost)
+
+
+def run(samples, tag, lookback_min):
     """Calibração por decil + estratégias favorito/longshot."""
     n = len(samples)
     print("\n" + "=" * 72)
     print(f"FAVORITE-LONGSHOT BIAS — tag={tag}  amostra={n}  "
           f"ref={lookback_min}m antes da resolução")
-    print(f"taxa taker (pico) = {rate:.0%}  (dinâmica: rate*(1-p))")
+    print("taxa taker dinâmica: fee = feeRate * p * (1-p)   (feeRate lida do feeSchedule)")
     print("=" * 72)
 
-    # ---- calibração por decil ----
+    # ---- calibração por decil (preço do 'Yes' vs win rate real do 'Yes') ----
     buckets: dict[int, list] = {}
-    for q, tf, won, ref in samples:
-        if ref is None:
+    for s in samples:
+        if s.ref is None:
             continue
-        dec = int(ref * 10)  # 0..9
+        dec = int(s.ref * 10)
         dec = min(9, max(0, dec))
-        buckets.setdefault(dec, []).append((ref, won))
+        buckets.setdefault(dec, []).append((s.ref, s.won))
 
     print(f"\n{'decil':>6} | {'n':>5} | {'preço médio':>11} | {'win real':>9} | {'bias':>7}")
     print("-" * 72)
@@ -207,7 +278,7 @@ def run(samples, tag, lookback_min, rate):
         print(f"{dec*10:>3}-{(dec+1)*10:>3} | {len(rows):>5} | {mean_p:>11.3f} | "
               f"{win:>9.2%} | {bias:>+7.3f}")
 
-    print("\n(bias > 0 => vence MAIS que o preço [subprecificado]; bias < 0 => vence MENOS [superprecificado])")
+    print("\n(bias > 0 => 'Yes' vence MAIS que o preço [subprecificado]; bias < 0 => vence MENOS [superprecificado])")
     print("Longshot bias clássico: decil baixo com bias < 0, decil alto com bias > 0.")
 
     # ---- estratégias ----
@@ -220,25 +291,21 @@ def run(samples, tag, lookback_min, rate):
     ):
         pnls = []
         wins = 0
-        trades = 0
-        for q, tf, won, ref in samples:
-            if ref is None or ref < lo or ref > hi:
+        for s in samples:
+            if s.ref is None or s.ref < lo or s.ref > hi:
                 continue
-            # preço do lado que compramos
-            entry = ref if buy_yes else (1 - ref)
-            side_won = won if buy_yes else (not won)
-            fee = taker_fee_frac(entry, rate)
-            pnl = (1 - entry * (1 + fee)) if side_won else (-entry * (1 + fee))
+            entry = s.ref if buy_yes else (1 - s.ref)
+            side_won = s.won if buy_yes else (not s.won)
+            pnl = simulate_hold(entry, side_won, s.rate, s.exponent)
             pnls.append(pnl)
-            trades += 1
             if pnl > 0:
                 wins += 1
-        if trades < 10:
-            print(f"  {name:<34}: trades={trades} (insuficiente)")
+        if len(pnls) < 10:
+            print(f"  {name:<44}: trades={len(pnls)} (insuficiente)")
             continue
-        ev = sum(pnls) / trades
-        wr = wins / trades
-        print(f"  {name:<34}: trades={trades:>4}  win%={wr:>5.1%}  EV={ev:+.4f}")
+        ev = sum(pnls) / len(pnls)
+        wr = wins / len(pnls)
+        print(f"  {name:<44}: trades={len(pnls):>4}  win%={wr:>5.1%}  EV={ev:+.4f}")
 
     print("\n(EV > 0 => estratégia lucrativa líquida de taxa, nesta amostra.)")
 
@@ -248,41 +315,52 @@ def main():
     parser.add_argument("--tag", default="sports", choices=["sports", "politics", "economics", "crypto"])
     parser.add_argument("--lookback", type=int, default=60, help="minutos antes da resolução")
     parser.add_argument("--days", type=int, default=45)
-    parser.add_argument("--limit", type=int, default=1500)
+    parser.add_argument("--limit", type=int, default=3000)
     args = parser.parse_args()
 
     s = get_settings()
     now = datetime.now(timezone.utc)
-    end_max = now.strftime("%Y-%m-%d")
-    end_min = (now - timedelta(days=args.days)).strftime("%Y-%m-%d")
+    cutoff_ts = (now - timedelta(days=args.days)).timestamp()
 
-    print(f"Coletando mercados resolvidos [{args.tag}] nos últimos {args.days} dias ...")
-    markets = fetch_tag_markets(s, args.tag, end_min, end_max, args.limit)
-    print(f"mercados binários resolvidos: {len(markets)}")
+    print(f"Coletando mercados resolvidos [{args.tag}] (últimos {args.days} dias) ...")
+    markets = fetch_tag_markets(s, args.tag, cutoff_ts, args.limit)
+    print(f"mercados Yes/No resolvidos na janela: {len(markets)}")
 
     samples = []
-    for mjson in markets:
+    for mjson, res_ts in markets:
         won = yes_won(mjson)
         if won is None:
             continue
-        tokens = _loads(mjson.get("clobTokenIds"), [])
-        yes_tok = tokens[0] if _loads(mjson.get("outcomes"), ["Yes", "No"])[0].lower() == "yes" else tokens[1]
+        tok = yes_token_id(mjson)
+        if not tok:
+            continue
         try:
-            hist = fetch_price_history(s, yes_tok)
+            hist = fetch_price_history(s, tok)
         except requests.RequestException:
             continue
         if len(hist) < 3:
             continue
-        ref = reference_price(hist, args.lookback)
-        samples.append((mjson.get("question", ""), None, won, ref))
+        ref = reference_price(hist, res_ts, args.lookback)
+        rate, exponent = market_fee(mjson, args.tag)
+        samples.append(Sample(mjson.get("question", ""), won, ref, rate, exponent))
         time.sleep(0.03)
 
     print(f"amostra com preço de referência válido: {len(samples)}")
     if not samples:
         print("Nada para avaliar.")
         return
-    rate = TAG_FEE_RATE.get(args.tag, 0.05)
-    run(samples, args.tag, args.lookback, rate)
+    run(samples, args.tag, args.lookback)
+
+
+class Sample:
+    __slots__ = ("question", "won", "ref", "rate", "exponent")
+
+    def __init__(self, question, won, ref, rate, exponent):
+        self.question = question
+        self.won = won          # 'Yes' venceu?
+        self.ref = ref          # preço do 'Yes' no ponto de referência
+        self.rate = rate        # feeRate do mercado
+        self.exponent = exponent
 
 
 if __name__ == "__main__":
