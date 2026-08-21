@@ -1,0 +1,4 @@
+requests>=2.31
+python-dotenv>=1.0
+ccxt>=4.2          # spot feed (opcional para o sinal)
+# py-clob-client    # descomente apenas na F4 (execução real)
