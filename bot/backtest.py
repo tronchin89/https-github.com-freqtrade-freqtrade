@@ -46,44 +46,55 @@ def _loads(value, default):
         return default
 
 
+def _day_range(start: str, end: str):
+    """Gera (YYYY-MM-DD, YYYY-MM-DD) para cada dia entre start e end (inclusive)."""
+    from datetime import datetime, timedelta
+    d0 = datetime.strptime(start, "%Y-%m-%d")
+    d1 = datetime.strptime(end, "%Y-%m-%d")
+    cur = d0
+    while cur <= d1:
+        day = cur.strftime("%Y-%m-%d")
+        yield day, day
+        cur += timedelta(days=1)
+
+
 def fetch_closed_markets(s: Settings, coin: str, timeframes, limit: int,
                          end_date_min: str, end_date_max: str):
     """Mercados já resolvidos (recentes), com token 'Up' e histórico de preço.
 
-    Usa `end_date_min/max` para pegar só mercados que resolveram no período
-    (sem filtro, `closed=true` retorna mercados antigos primeiro).
-    Pagina com offset até atingir `limit` por série.
+    A Gamma API limita o `offset` (rejeita >~2000 com HTTP 422), então em vez
+    de paginar por offset, quebramos a janela em blocos DIÁRIOS e consultamos
+    cada dia separadamente (um dia de 15m tem ~96 eventos, cabe em 1 página).
     """
     coin = coin.strip().lower()
     slugs = SERIES_BY_COIN.get(coin, {})
     out = []
     seen = set()
-    # A API da Gamma cap ~100 eventos por página (independente do `limit` pedido).
     page_size = 100
+
     for tf in timeframes:
         slug = slugs.get(tf)
         if not slug:
             continue
-        offset = 0
         collected = 0
-        while collected < limit:
+        for day_min, day_max in _day_range(end_date_min, end_date_max):
+            if collected >= limit:
+                break
             params = {
                 "series_slug": slug,
                 "closed": "true",
-                "end_date_min": end_date_min,
-                "end_date_max": end_date_max,
+                "end_date_min": day_min,
+                "end_date_max": day_max,
                 "limit": page_size,
-                "offset": offset,
+                "offset": 0,
             }
             try:
                 resp = requests.get(f"{s.gamma_host}/events", params=params, timeout=20)
                 resp.raise_for_status()
             except requests.RequestException as e:
-                print(f"  [aviso] série {slug}: {e!r}")
-                break
+                print(f"  [aviso] série {slug} {day_min}: {e!r}")
+                continue
             events = resp.json()
-            if not events:
-                break
             for ev in events:
                 for mjson in ev.get("markets", []):
                     m = _parse_market(mjson, tf)
@@ -92,11 +103,7 @@ def fetch_closed_markets(s: Settings, coin: str, timeframes, limit: int,
                     seen.add(m.id)
                     out.append((m, mjson))
                     collected += 1
-            # página cheia => continua; senão terminou a série
-            if len(events) < page_size:
-                break
-            offset += page_size
-            time.sleep(0.1)  # gentileza com a API entre páginas
+            time.sleep(0.05)  # gentileza com a API
     return out
 
 
