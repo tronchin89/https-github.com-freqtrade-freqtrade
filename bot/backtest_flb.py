@@ -141,12 +141,16 @@ def market_fee(mjson, tag: str) -> tuple[float, float]:
     return rate, exponent
 
 
-def fetch_tag_markets(s: Settings, tag: str, cutoff_ts: float, limit: int):
+def fetch_tag_markets(s: Settings, tag: str, cutoff_ts: float, limit: int,
+                      min_volume: float = 0.0):
     """Mercados resolvidos Yes/No da tag, mais recentes primeiro, até `cutoff_ts`.
 
     Usa `order=closedTime&ascending=false` + offset (NÃO filtra por end_date:
     endDate é o prazo agendado, e ranges vazios dão 422). Para de paginar ao
     passar de `cutoff_ts` ou ao atingir `limit`.
+
+    `min_volume` (USD) descarta mercados ilíquidos — neles o preço de último
+    trade fica "stale" e não representa o preço executável.
     """
     session = _session()
     out = []
@@ -179,6 +183,13 @@ def fetch_tag_markets(s: Settings, tag: str, cutoff_ts: float, limit: int):
             for mjson in ev.get("markets", []):
                 if not is_yesno(mjson):
                     continue
+                if min_volume > 0:
+                    try:
+                        vol = float(mjson.get("volumeNum") or mjson.get("volume") or 0)
+                    except (TypeError, ValueError):
+                        vol = 0.0
+                    if vol < min_volume:
+                        continue
                 mid = mjson.get("id")
                 if mid in seen:
                     continue
@@ -395,6 +406,8 @@ def main():
                         help="janela de liquidez: último trade a <=N min do ponto de ref (0=desliga)")
     parser.add_argument("--min-trades", type=int, default=2,
                         help="mínimo de trades dentro da janela de liquidez")
+    parser.add_argument("--min-volume", type=float, default=0,
+                        help="volume mínimo do mercado (USD) — filtra micro-mercados ilíquidos")
     args = parser.parse_args()
 
     max_stale = args.max_stale_min if args.max_stale_min > 0 else None
@@ -403,8 +416,9 @@ def main():
     now = datetime.now(timezone.utc)
     cutoff_ts = (now - timedelta(days=args.days)).timestamp()
 
-    print(f"Coletando mercados resolvidos [{args.tag}] (últimos {args.days} dias) ...")
-    markets = fetch_tag_markets(s, args.tag, cutoff_ts, args.limit)
+    print(f"Coletando mercados resolvidos [{args.tag}] (últimos {args.days} dias"
+          f"{f', volume>={args.min_volume:.0f} USD' if args.min_volume > 0 else ''}) ...")
+    markets = fetch_tag_markets(s, args.tag, cutoff_ts, args.limit, args.min_volume)
     print(f"mercados Yes/No resolvidos na janela: {len(markets)}")
 
     cache = PriceCache(args.cache or "")
