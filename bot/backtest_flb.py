@@ -219,20 +219,30 @@ def fetch_price_history(s: Settings, token_id: str) -> list[tuple[int, float]]:
     return out
 
 
-def reference_price(hist: list[tuple[int, float]], res_ts: float, lookback_min: int) -> float | None:
-    """Preço `lookback_min` minutos antes da resolução (ponto negociável)."""
+def reference_price(hist: list[tuple[int, float]], res_ts: float, lookback_min: int,
+                    max_stale_min: float | None = None) -> float | None:
+    """Preço `lookback_min` minutos antes da resolução (ponto negociável).
+
+    Se `max_stale_min` for dado, rejeita (retorna None) quando o último trade
+    antes do ponto de referência é MAIS antigo que `max_stale_min` minutos —
+    isto é, quando o preço está "stale" (mercado ilíquido, não negociável na
+    prática). Sem esse filtro, favoritos/longshots ilíquidos perto da resolução
+    viram "vencer 100%" / "vencer 0%", inflando o EV de forma irreal.
+    """
     if not hist:
         return None
     target_t = res_ts - lookback_min * 60
-    best = None
+    best_t = best_p = None
     for t, p in hist:
         if t <= target_t:
-            best = p
+            best_t, best_p = t, p
         else:
             break
-    if best is None:
-        best = hist[0][1]  # histórico curto: usa o primeiro preço disponível
-    return best
+    if best_p is None:
+        best_t, best_p = hist[0]
+    if max_stale_min is not None and (target_t - best_t) > max_stale_min * 60:
+        return None
+    return best_p
 
 
 class PriceCache:
@@ -348,27 +358,30 @@ def run(samples, tag, lookback_min):
     print("\n(EV > 0 => estratégia lucrativa líquida de taxa, nesta amostra.)")
 
 
-def _process_one(item, s: Settings, tag: str, lookback: int, cache: PriceCache):
-    """Processa um mercado: vencedor + preço de referência + taxa."""
+def _process_one(item, s: Settings, tag: str, lookback: int, max_stale: float | None,
+                 cache: PriceCache):
+    """Processa um mercado. Retorna (kind, Sample|None); kind in {ok, stale, skip}."""
     mjson, res_ts = item
     won = yes_won(mjson)
     if won is None:
-        return None
+        return ("skip", None)
     tok = yes_token_id(mjson)
     if not tok:
-        return None
+        return ("skip", None)
     hist = cache.get(tok)
     if hist is None:
         try:
             hist = fetch_price_history(s, tok)
         except requests.RequestException:
-            return None
+            return ("skip", None)
         cache.set(tok, hist)
     if len(hist) < 3:
-        return None
-    ref = reference_price(hist, res_ts, lookback)
+        return ("skip", None)
+    ref = reference_price(hist, res_ts, lookback, max_stale)
+    if ref is None:
+        return ("stale", None)
     rate, exponent = market_fee(mjson, tag)
-    return Sample(mjson.get("question", ""), won, ref, rate, exponent)
+    return ("ok", Sample(mjson.get("question", ""), won, ref, rate, exponent))
 
 
 def main():
@@ -379,7 +392,11 @@ def main():
     parser.add_argument("--limit", type=int, default=3000)
     parser.add_argument("--workers", type=int, default=8, help="threads p/ baixar histórico de preço")
     parser.add_argument("--cache", default="flb_price_cache.json", help="cache de histórico ('' desliga)")
+    parser.add_argument("--max-stale-min", type=float, default=30,
+                        help="rejeita preço se o último trade é >N min antes do ponto de ref (0=desliga)")
     args = parser.parse_args()
+
+    max_stale = args.max_stale_min if args.max_stale_min > 0 else None
 
     s = get_settings()
     now = datetime.now(timezone.utc)
@@ -394,17 +411,23 @@ def main():
         print(f"cache de preço: {len(cache._data)} tokens já em disco")
 
     samples = []
+    n_ok = n_stale = n_skip = 0
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        for i, smp in enumerate(pool.map(
-            lambda it: _process_one(it, s, args.tag, args.lookback, cache), markets
+        for i, (kind, smp) in enumerate(pool.map(
+            lambda it: _process_one(it, s, args.tag, args.lookback, max_stale, cache), markets
         )):
-            if smp is not None:
+            if kind == "ok":
                 samples.append(smp)
+                n_ok += 1
+            elif kind == "stale":
+                n_stale += 1
+            else:
+                n_skip += 1
             if (i + 1) % 500 == 0:
-                print(f"  ... {i + 1}/{len(markets)} processados, válidos={len(samples)}")
+                print(f"  ... {i + 1}/{len(markets)} processados (ok={n_ok} stale={n_stale} skip={n_skip})")
 
     cache.save()
-    print(f"amostra com preço de referência válido: {len(samples)}")
+    print(f"amostra válida: {n_ok}   descartados por preço stale: {n_stale}   outros: {n_skip}")
     if not samples:
         print("Nada para avaliar.")
         return
