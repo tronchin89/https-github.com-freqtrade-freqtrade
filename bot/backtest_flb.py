@@ -220,29 +220,28 @@ def fetch_price_history(s: Settings, token_id: str) -> list[tuple[int, float]]:
 
 
 def reference_price(hist: list[tuple[int, float]], res_ts: float, lookback_min: int,
-                    max_stale_min: float | None = None) -> float | None:
+                    max_stale_min: float | None = None, min_trades: int = 1) -> float | None:
     """Preço `lookback_min` minutos antes da resolução (ponto negociável).
 
-    Se `max_stale_min` for dado, rejeita (retorna None) quando o último trade
-    antes do ponto de referência é MAIS antigo que `max_stale_min` minutos —
-    isto é, quando o preço está "stale" (mercado ilíquido, não negociável na
-    prática). Sem esse filtro, favoritos/longshots ilíquidos perto da resolução
-    viram "vencer 100%" / "vencer 0%", inflando o EV de forma irreal.
+    Filtros de liquidez (contra preço "stale" de mercado ilíquido):
+      - max_stale_min: só aceita último trade dentro de N min do ponto de ref.
+      - min_trades: exige >=N trades dentro dessa janela (aproxima mercado
+        ativo/bilateral). Sem isso, in-play decidido mantém último trade antigo
+        e o preço não é executável.
     """
     if not hist:
         return None
     target_t = res_ts - lookback_min * 60
-    best_t = best_p = None
-    for t, p in hist:
-        if t <= target_t:
-            best_t, best_p = t, p
-        else:
-            break
-    if best_p is None:
-        best_t, best_p = hist[0]
-    if max_stale_min is not None and (target_t - best_t) > max_stale_min * 60:
+    pts = [(t, p) for t, p in hist if t <= target_t]
+    if not pts:
+        pts = [hist[0]]
+    if max_stale_min is None:
+        return pts[-1][1]
+    window_start = target_t - max_stale_min * 60
+    recent = [(t, p) for t, p in pts if t >= window_start]
+    if len(recent) < min_trades:
         return None
-    return best_p
+    return recent[-1][1]
 
 
 class PriceCache:
@@ -359,7 +358,7 @@ def run(samples, tag, lookback_min):
 
 
 def _process_one(item, s: Settings, tag: str, lookback: int, max_stale: float | None,
-                 cache: PriceCache):
+                 min_trades: int, cache: PriceCache):
     """Processa um mercado. Retorna (kind, Sample|None); kind in {ok, stale, skip}."""
     mjson, res_ts = item
     won = yes_won(mjson)
@@ -377,7 +376,7 @@ def _process_one(item, s: Settings, tag: str, lookback: int, max_stale: float | 
         cache.set(tok, hist)
     if len(hist) < 3:
         return ("skip", None)
-    ref = reference_price(hist, res_ts, lookback, max_stale)
+    ref = reference_price(hist, res_ts, lookback, max_stale, min_trades)
     if ref is None:
         return ("stale", None)
     rate, exponent = market_fee(mjson, tag)
@@ -393,7 +392,9 @@ def main():
     parser.add_argument("--workers", type=int, default=8, help="threads p/ baixar histórico de preço")
     parser.add_argument("--cache", default="flb_price_cache.json", help="cache de histórico ('' desliga)")
     parser.add_argument("--max-stale-min", type=float, default=30,
-                        help="rejeita preço se o último trade é >N min antes do ponto de ref (0=desliga)")
+                        help="janela de liquidez: último trade a <=N min do ponto de ref (0=desliga)")
+    parser.add_argument("--min-trades", type=int, default=2,
+                        help="mínimo de trades dentro da janela de liquidez")
     args = parser.parse_args()
 
     max_stale = args.max_stale_min if args.max_stale_min > 0 else None
@@ -414,7 +415,8 @@ def main():
     n_ok = n_stale = n_skip = 0
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         for i, (kind, smp) in enumerate(pool.map(
-            lambda it: _process_one(it, s, args.tag, args.lookback, max_stale, cache), markets
+            lambda it: _process_one(it, s, args.tag, args.lookback, max_stale, args.min_trades, cache),
+            markets
         )):
             if kind == "ok":
                 samples.append(smp)
@@ -427,7 +429,7 @@ def main():
                 print(f"  ... {i + 1}/{len(markets)} processados (ok={n_ok} stale={n_stale} skip={n_skip})")
 
     cache.save()
-    print(f"amostra válida: {n_ok}   descartados por preço stale: {n_stale}   outros: {n_skip}")
+    print(f"amostra válida: {n_ok}   descartados por liquidez/stale: {n_stale}   outros: {n_skip}")
     if not samples:
         print("Nada para avaliar.")
         return
