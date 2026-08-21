@@ -27,7 +27,10 @@ from __future__ import annotations
 
 import argparse
 import json as _json
+import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -232,6 +235,41 @@ def reference_price(hist: list[tuple[int, float]], res_ts: float, lookback_min: 
     return best
 
 
+class PriceCache:
+    """Cache em disco do histórico de preço por token (evita re-baixar)."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._lock = threading.Lock()
+        self._data: dict[str, list] = {}
+        if path and os.path.exists(path):
+            try:
+                with open(path) as fh:
+                    raw = _json.load(fh)
+                if isinstance(raw, dict):
+                    self._data = {k: [[int(t), float(p)] for t, p in v] for k, v in raw.items()}
+            except (ValueError, OSError):
+                self._data = {}
+
+    def get(self, token_id: str):
+        with self._lock:
+            return self._data.get(token_id)
+
+    def set(self, token_id: str, hist):
+        with self._lock:
+            self._data[token_id] = [[int(t), float(p)] for t, p in hist]
+
+    def save(self):
+        if not self.path:
+            return
+        with self._lock:
+            data = dict(self._data)
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as fh:
+            _json.dump(data, fh)
+        os.replace(tmp, self.path)
+
+
 def fee_fraction(price: float, rate: float, exponent: float = 1.0) -> float:
     """Taxa taker como fração do notional (fórmula V3).
 
@@ -310,12 +348,37 @@ def run(samples, tag, lookback_min):
     print("\n(EV > 0 => estratégia lucrativa líquida de taxa, nesta amostra.)")
 
 
+def _process_one(item, s: Settings, tag: str, lookback: int, cache: PriceCache):
+    """Processa um mercado: vencedor + preço de referência + taxa."""
+    mjson, res_ts = item
+    won = yes_won(mjson)
+    if won is None:
+        return None
+    tok = yes_token_id(mjson)
+    if not tok:
+        return None
+    hist = cache.get(tok)
+    if hist is None:
+        try:
+            hist = fetch_price_history(s, tok)
+        except requests.RequestException:
+            return None
+        cache.set(tok, hist)
+    if len(hist) < 3:
+        return None
+    ref = reference_price(hist, res_ts, lookback)
+    rate, exponent = market_fee(mjson, tag)
+    return Sample(mjson.get("question", ""), won, ref, rate, exponent)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tag", default="sports", choices=["sports", "politics", "economics", "crypto"])
     parser.add_argument("--lookback", type=int, default=60, help="minutos antes da resolução")
     parser.add_argument("--days", type=int, default=45)
     parser.add_argument("--limit", type=int, default=3000)
+    parser.add_argument("--workers", type=int, default=8, help="threads p/ baixar histórico de preço")
+    parser.add_argument("--cache", default="flb_price_cache.json", help="cache de histórico ('' desliga)")
     args = parser.parse_args()
 
     s = get_settings()
@@ -326,25 +389,21 @@ def main():
     markets = fetch_tag_markets(s, args.tag, cutoff_ts, args.limit)
     print(f"mercados Yes/No resolvidos na janela: {len(markets)}")
 
-    samples = []
-    for mjson, res_ts in markets:
-        won = yes_won(mjson)
-        if won is None:
-            continue
-        tok = yes_token_id(mjson)
-        if not tok:
-            continue
-        try:
-            hist = fetch_price_history(s, tok)
-        except requests.RequestException:
-            continue
-        if len(hist) < 3:
-            continue
-        ref = reference_price(hist, res_ts, args.lookback)
-        rate, exponent = market_fee(mjson, args.tag)
-        samples.append(Sample(mjson.get("question", ""), won, ref, rate, exponent))
-        time.sleep(0.03)
+    cache = PriceCache(args.cache or "")
+    if cache._data:
+        print(f"cache de preço: {len(cache._data)} tokens já em disco")
 
+    samples = []
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        for i, smp in enumerate(pool.map(
+            lambda it: _process_one(it, s, args.tag, args.lookback, cache), markets
+        )):
+            if smp is not None:
+                samples.append(smp)
+            if (i + 1) % 500 == 0:
+                print(f"  ... {i + 1}/{len(markets)} processados, válidos={len(samples)}")
+
+    cache.save()
     print(f"amostra com preço de referência válido: {len(samples)}")
     if not samples:
         print("Nada para avaliar.")
