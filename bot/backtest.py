@@ -46,33 +46,52 @@ def _loads(value, default):
         return default
 
 
-def fetch_closed_markets(s: Settings, coin: str, timeframes, limit: int):
-    """Mercados já resolvidos, com token 'Up' e histórico de preço válido."""
+def fetch_closed_markets(s: Settings, coin: str, timeframes, limit: int,
+                         end_date_min: str, end_date_max: str):
+    """Mercados já resolvidos (recentes), com token 'Up' e histórico de preço.
+
+    Usa `end_date_min/max` para pegar só mercados que resolveram no período
+    (sem filtro, `closed=true` retorna mercados antigos primeiro).
+    Pagina com offset até atingir `limit` por série.
+    """
     coin = coin.strip().lower()
     slugs = SERIES_BY_COIN.get(coin, {})
     out = []
     seen = set()
+    page_size = min(limit, 500)
     for tf in timeframes:
         slug = slugs.get(tf)
         if not slug:
             continue
-        try:
-            resp = requests.get(
-                f"{s.gamma_host}/events",
-                params={"series_slug": slug, "closed": "true", "limit": limit},
-                timeout=20,
-            )
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            print(f"  [aviso] série {slug}: {e!r}")
-            continue
-        for ev in resp.json():
-            for mjson in ev.get("markets", []):
-                m = _parse_market(mjson, tf)
-                if m.id in seen or not m.token_ids:
-                    continue
-                seen.add(m.id)
-                out.append((m, mjson))
+        offset = 0
+        while len([m for m, _ in out]) < limit * len(timeframes) and offset < limit:
+            params = {
+                "series_slug": slug,
+                "closed": "true",
+                "end_date_min": end_date_min,
+                "end_date_max": end_date_max,
+                "limit": page_size,
+                "offset": offset,
+            }
+            try:
+                resp = requests.get(f"{s.gamma_host}/events", params=params, timeout=20)
+                resp.raise_for_status()
+            except requests.RequestException as e:
+                print(f"  [aviso] série {slug}: {e!r}")
+                break
+            events = resp.json()
+            if not events:
+                break
+            for ev in events:
+                for mjson in ev.get("markets", []):
+                    m = _parse_market(mjson, tf)
+                    if m.id in seen or not m.token_ids:
+                        continue
+                    seen.add(m.id)
+                    out.append((m, mjson))
+            if len(events) < page_size:
+                break
+            offset += page_size
     return out
 
 
@@ -107,10 +126,14 @@ def ev_meta(mjson: dict) -> dict:
 
 
 def fetch_price_history(s: Settings, token_id: str) -> list[tuple[int, float]]:
-    """Histórico de preço do token (t: timestamp, p: preço)."""
+    """Histórico de preço do token (t: timestamp, p: preço).
+
+    Usa `interval=max` para pegar o histórico COMPLETO do token (com `1d`
+    só vem a última janela, que fica vazia para mercados já resolvidos).
+    """
     resp = requests.get(
         f"{s.clob_host}/prices-history",
-        params={"market": token_id, "interval": "1d", "fidelity": 1},
+        params={"market": token_id, "interval": "max", "fidelity": 1},
         timeout=20,
     )
     resp.raise_for_status()
@@ -137,8 +160,9 @@ class MarketSample:
     history: list[tuple[int, float]]  # (t, p) ordenado
 
 
-def collect_samples(s: Settings, coin: str, timeframes, limit: int) -> list[MarketSample]:
-    markets = fetch_closed_markets(s, coin, timeframes, limit)
+def collect_samples(s: Settings, coin: str, timeframes, limit: int,
+                    end_date_min: str, end_date_max: str) -> list[MarketSample]:
+    markets = fetch_closed_markets(s, coin, timeframes, limit, end_date_min, end_date_max)
     samples: list[MarketSample] = []
     for m, mjson in markets:
         won = up_won(mjson, m)
@@ -154,7 +178,7 @@ def collect_samples(s: Settings, coin: str, timeframes, limit: int) -> list[Mark
         if len(hist) < 5:
             continue
         samples.append(MarketSample(m.question, m.timeframe, won, hist))
-        time.sleep(0.05)  # gentileza com a API
+        time.sleep(0.03)  # gentileza com a API
     return samples
 
 
@@ -209,16 +233,24 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--coin", default="bitcoin")
     parser.add_argument("--timeframes", default="1h,15m")
-    parser.add_argument("--limit", type=int, default=300)
+    parser.add_argument("--limit", type=int, default=500)
+    parser.add_argument("--days", type=int, default=14,
+                        help="janela de mercados resolvidos (dias para trás)")
     args = parser.parse_args()
 
+    from datetime import datetime, timedelta, timezone
     s = get_settings()
     timeframes = [t.strip() for t in args.timeframes.split(",")]
     thresholds = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
 
+    now = datetime.now(timezone.utc)
+    end_date_max = now.strftime("%Y-%m-%d")
+    end_date_min = (now - timedelta(days=args.days)).strftime("%Y-%m-%d")
+
     print(f"Coletando mercados resolvidos de {args.coin} "
-          f"({', '.join(timeframes)}) ...")
-    samples = collect_samples(s, args.coin, timeframes, args.limit)
+          f"({', '.join(timeframes)}) nos últimos {args.days} dias ...")
+    samples = collect_samples(s, args.coin, timeframes, args.limit,
+                              end_date_min, end_date_max)
     print(f"amostra válida: {len(samples)} mercados")
 
     if not samples:
